@@ -73,7 +73,7 @@ class JointLoss(nn.Module):
         if target.dim() == 2:
             target = target.unsqueeze(1)
 
-        recon_loss = self.recon_loss_fn(output, target) + 0.01 * self.mask_loss_fn(output)
+        recon_loss = self.recon_loss_fn(output, target)
         mask_loss = self.mask_loss_fn(binary_output)
 
         total = self.alpha * recon_loss + self.beta * mask_loss + 1e-6  
@@ -93,37 +93,13 @@ class ConvBlock1D(nn.Module):
     def forward(self, x):
         return self.block(x)
 
-
-class DistanceGate(nn.Module):
-    def __init__(self, init_thresh=0.1, init_alpha=100.0, learn_alpha=True):
-        super().__init__()
-        self.dc = nn.Parameter(torch.tensor(init_thresh))
-        if learn_alpha:
-            self.alpha = nn.Parameter(torch.tensor(init_alpha))
-        else:
-            self.alpha = torch.tensor(init_alpha)
-
-    def forward(self, distance):
-        # distance: shape (B, 1, T)
-        alpha = torch.clamp(self.alpha, 1.0, 100.0)
-        dc = torch.clamp(self.dc, 0.005, 2.0)
-        return torch.sigmoid(alpha * (dc - distance))
-    
-
 class UNet1DVariableDecoder(nn.Module):
-    def __init__(self, in_channels, encoder_depth=4, decoder_depth=6, base_channels=64,
-                 init_thresh=0.1, init_alpha=10.0, learn_alpha=False,
-                 use_DistanceGate_mask=True):
+    def __init__(self, in_channels, encoder_depth=4, decoder_depth=6, base_channels=64):
         super().__init__()
         assert decoder_depth >= encoder_depth, "Decoder must be at least as deep as encoder"
 
         self.encoder_depth = encoder_depth
         self.decoder_depth = decoder_depth
-
-        self.use_DistanceGate_mask=use_DistanceGate_mask
-        self.gate = DistanceGate(init_thresh=init_thresh,
-                                 init_alpha=init_alpha,
-                                 learn_alpha=learn_alpha)
 
         self.downs = nn.ModuleList()
         self.pool = nn.MaxPool1d(kernel_size=2)
@@ -158,14 +134,9 @@ class UNet1DVariableDecoder(nn.Module):
             self.reduce_channels.append(nn.Conv1d(concat_ch, ch // 2, kernel_size=1))
             ch = ch // 2
 
-        self.final_conv = nn.Conv1d(ch, 128, kernel_size=1)
+        self.final_conv = nn.Conv1d(ch, 1, kernel_size=1)
 
     def forward(self, x):
-        distance = x[:, 3, :].unsqueeze(1)  # shape: (B, 1, T)
-        if self.use_DistanceGate_mask:
-            distance_signal = self.gate(distance)  # shape: (B, 1, T)
-            x *= distance_signal  # Apply gate to input
-
         encs = []
         for down in self.downs:
             x = down(x)
@@ -200,10 +171,10 @@ class ResidualBlock1D(nn.Module):
         return self.relu(out + residual)
 
 class CNNReconstructorResidual(nn.Module):
-    def __init__(self, out_channels, output_length, base_channels=64):
+    def __init__(self, out_channels, output_length, base_channels=32):
         super().__init__()
         self.output_length = output_length
-        self.initial_conv = nn.Conv1d(128, base_channels, kernel_size=3, padding=1)
+        self.initial_conv = nn.Conv1d(1, base_channels, kernel_size=3, padding=1)
         self.res_block1 = ResidualBlock1D(base_channels)
         self.res_block2 = ResidualBlock1D(base_channels)
         self.final_conv1 = nn.Conv1d(base_channels, out_channels, kernel_size=1)
@@ -244,7 +215,7 @@ def train_epoch(model_unet, model_decoder, dataloader, optimizer, criterion, dev
         output = model_decoder(binary_output)
         output = output.clamp(-20, 20)  # logits are raw, keep in safe range
         binary_output = torch.sigmoid(binary_output)
-        loss, recon_loss, mask_loss = criterion(output, output_target, binary_output)
+        loss, recon_loss, mask_loss = criterion(output, state_target, binary_output)
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"⚠️ NaN/Inf detected in loss at batch {i}. Skipping update.")
@@ -296,41 +267,29 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
         output = output.clamp(-20, 20)  # logits are raw, keep in safe range
 
         binary_output = torch.sigmoid(binary_output)
-        val_loss, _, _ = criterion(output, output_target, binary_output)
+        val_loss, _, _ = criterion(output, state_target, binary_output)
 
         total_loss += val_loss.item()
         val_preds.append(torch.sigmoid(output).squeeze(1).cpu())
         val_targets.append(output_target.cpu())
 
         clear_cuda_memory()
-        del X_batch, y_batch, binary_output, output, val_loss
 
-    total_val_loss = total_loss / len(dataloader)
-    if total_val_loss < best_val_loss:
-        print(f"New best validation loss: {total_val_loss:.4f} at best_val_loss {best_val_loss}")
-        best_val_loss = total_val_loss
-        best_model_state = {
-            'model_unet': model_unet.state_dict(),
-            'model_decoder': model_decoder.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-            'val_loss': total_val_loss
-        }
-        torch.save(best_model_state, "best_model_EP_to_MS2.pt")
-    
-    
-    last_model_state = {
-            'model_unet': model_unet.state_dict(),
-            'model_decoder': model_decoder.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-            'val_loss': total_val_loss
-        }
-    torch.save(last_model_state, "last_model_EP_to_MS2.pt")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = {
+                'model_unet': model_unet.state_dict(),
+                'model_decoder': model_decoder.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'val_loss': val_loss
+            }
+            torch.save(best_model_state, "best_model_MS2_to_states.pt")
+        del X_batch, y_batch, binary_output, output, val_loss
 
     val_preds = torch.cat(val_preds).numpy().flatten()
     val_targets = torch.cat(val_targets).numpy().flatten()
-    return total_val_loss, val_preds, val_targets, best_val_loss
+    return total_loss / len(dataloader), val_preds, val_targets
 
 
 
@@ -389,23 +348,14 @@ plt.xlabel("Time")
 plt.ylabel("Distance")
 plt.show()
 
-y = torch.stack(y).to(device)
-
-X = torch.stack(C).to(device)  # [N, 3, T_in] 
-D = torch.tensor(D, dtype=torch.float32).to(device)  # [N, T_in]
-X = torch.cat((X, D.unsqueeze(1)), dim=1)  # [N, 4, T_in]
-
-
+X = torch.stack(y).unsqueeze(1).to(device)  # [N, 1, T_in] 
+y = torch.stack(y)
 
 print(X.shape, y.shape)
 
-N_in = X.shape[1]   # Number of input channels +1 (for distance gate)
-N_out = 1  # Number of output channels (MS2 signal)
-T_in = y.shape[1]
-model_unet = UNet1DVariableDecoder(N_in, encoder_depth=2, decoder_depth=2, base_channels=8,
-                                   init_thresh=0.1, init_alpha=1.0, learn_alpha=False,
-                                   use_DistanceGate_mask=False)
-model_decoder = CNNReconstructorResidual(out_channels=N_out, output_length=T_in)
+B, N, T_in = 8, 1, y.shape[1]
+model_unet = UNet1DVariableDecoder(N, encoder_depth=2, decoder_depth=2, base_channels=8)
+model_decoder = CNNReconstructorResidual(out_channels=N, output_length=T_in)
 
 model_unet.to(device)
 model_decoder.to(device)
@@ -452,11 +402,12 @@ criterion = nn.BCEWithLogitsLoss()
 criterion = nn.MSELoss()
 
 criterion = JointLoss(
-    recon_loss_fn=nn.MSELoss(),
+    recon_loss_fn=nn.BCEWithLogitsLoss(
+    pos_weight=torch.tensor([pos_weight_train]).to(device)),
     mask_loss_fn=EntropyLoss(),
     #mask_loss_fn=NormalizedCutLoss(k=2),
     alpha=1.0,
-    beta=0.0
+    beta=0.05
 )
 
 state_loss_criterion = nn.BCEWithLogitsLoss(
@@ -468,26 +419,20 @@ optimizer = torch.optim.Adam(
 
 
 # ----- Training Loop -----
-num_epochs = 30
+num_epochs = 10
 train_losses = []
 val_losses = []
 
-best_val_loss = float('inf')  # initialize to a large value
 for epoch in trange(num_epochs, desc="Training Progress"):
     train_loss, recon_loss, mask_loss = train_epoch(model_unet, model_decoder, train_loader, optimizer, criterion, device)
-    val_loss, val_preds, val_targets, best_val_loss = validate_epoch(model_unet, model_decoder, val_loader, criterion, 
-                                                      best_val_loss=best_val_loss, best_model_state=None,
+    val_loss, val_preds, val_targets = validate_epoch(model_unet, model_decoder, val_loader, criterion, 
+                                                      best_val_loss=float('inf'), best_model_state=None,
                                                       device=device)
 
     train_losses.append(train_loss)
     val_losses.append(val_loss)
 
-    print("Learned threshold distance:", model_unet.gate.dc.item())
-    print("Learned alpha distance:", model_unet.gate.alpha.item())
-
     print(f"[Epoch {epoch+1}/{num_epochs}]  🔧 Train Loss: {train_loss:.4f}, Recon Loss: {recon_loss:.4f}, Mask Loss: {mask_loss:.4f} | 🧪 Val Loss: {val_loss:.4f}")
-
-print("Learned threshold distance:", model_unet.gate.dc.item())
 
 
 plt.figure(figsize=(8, 4))
@@ -503,23 +448,10 @@ plt.show()
 # %%
 torch.cuda.empty_cache()
 
-
 print(X_val.shape, y_val.shape)
-checkpoint = torch.load("last_model_EP_to_MS2.pt", map_location='cpu')
+checkpoint = torch.load("best_model_MS2_to_states.pt", map_location='cpu')
 model_unet.load_state_dict(checkpoint['model_unet'])
 model_decoder.load_state_dict(checkpoint['model_decoder'])
-
-print("Learned threshold distance:", model_unet.gate.dc.item())
-print("Learned alpha distance:", model_unet.gate.alpha.item())
-
-print(X_val.shape, y_val.shape)
-checkpoint = torch.load("best_model_EP_to_MS2.pt", map_location='cpu')
-model_unet.load_state_dict(checkpoint['model_unet'])
-model_decoder.load_state_dict(checkpoint['model_decoder'])
-
-print("Learned threshold distance:", model_unet.gate.dc.item())
-print("Learned alpha distance:", model_unet.gate.alpha.item())
-
 
 model_unet.eval()
 model_decoder.eval()
@@ -531,65 +463,47 @@ output = model_decoder(binary.to('cpu'))  # [B, N, T_in]
 binary = torch.sigmoid(binary)  # Apply sigmoid to get probabilities
 output = torch.sigmoid(output)  # Apply sigmoid to get probabilities
 output_binary = output > 0.5  # Apply sigmoid to get probabilities
-binary0 = binary[:,0,:]  # [B, T_out]
+binary0 = binary.squeeze(1)  # [B, T_out]
 output = output.squeeze(1)  # [B, T_in]
 
 
 
-x = torch.arange(0,1,0.01)
-y = torch.sigmoid(model_unet.gate.alpha.item() * (model_unet.gate.dc.item() - x))
-plt.figure(figsize=(8, 4))
-plt.plot(x, y, label='Sigmoid Gate Function')
-plt.axhline(0.5, color='red', linestyle='--', label='Threshold (0.5)')
-plt.xlabel('Distance')
-plt.ylabel('Gate Output')
-plt.title('Distance Gate Function')
-plt.legend()
-
-
 print(f"Binary output shape: {binary0.shape}")
 print(f"Output shape: {output.shape}")
-print(f"X_test shape: {X_test.shape}")
 # plot some outputs versus targets
 
-idx_chosen = np.random.randint(0, len(X_val))
+i = np.random.randint(0, len(X_val))
 
 
-fig, axs = plt.subplots(4,1,figsize=(12, 9))
+fig, axs = plt.subplots(3,1,figsize=(10, 9))
 
-axs[0].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten(), label='Signal', color='C0')
-axs[0].axhline(0.1, color='k', linestyle='--', label='Activation Threshold')
-#axs[0].plot(X_test[i,4,:].cpu().numpy().flatten(), label='GT State', color='C1')
-axs[0].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[0].plot(X_test[i].cpu().numpy().flatten(), label='MS2', color='C0')
+axs[0].plot(states_all_test[i].cpu().numpy().flatten(), label='GT State', color='C1')
+axs[0].plot(output[i].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 axs[0].set_xlabel("Time")
 axs[0].set_ylabel("Signal Value")
-axs[0].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
+axs[0].set_title(f"Residual of Output vs Binary sequence for X_test {i+1}")
 axs[0].legend()
 
-axs[1].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under threshold', color='k')
-axs[1].plot(y_test[idx_chosen,0,:].cpu().numpy().flatten(), label='GT State', color='C1')
-axs[1].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[1].plot(states_all_test[i].cpu().numpy().flatten(), label='GT State', color='C1')
+axs[1].plot(output[i].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[1].plot(output_binary[i].cpu().detach().numpy().flatten(), label='Pred. State', color='C3')
 axs[1].set_xlabel("Time")
 axs[1].set_ylabel("Signal Value")
-axs[1].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
+axs[1].set_title(f"Residual of Output vs Binary sequence for X_test {i+1}")
 axs[1].legend()
 
-axs[2].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under threshold', color='k')
-axs[2].plot(y_test[idx_chosen,0,:].cpu().numpy().flatten(), label='GT State', color='C1')
-axs[2].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[2].plot(states_all_test[i].cpu().numpy().flatten(), label='GT State', color='C1')
+axs[2].plot(output[i].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[2].plot(binary0[i].cpu().detach().numpy().flatten(), label='Binary', color='C3')
 axs[2].set_xlabel("Time")
 axs[2].set_ylabel("Signal Value")
-axs[2].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
+axs[2].set_title(f"Residual of Output vs Binary sequence for X_test {i+1}")
 axs[2].legend()
-
-axs[3].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
-axs[3].set_xlabel("Time")
-axs[3].set_ylabel("Signal Value")
-axs[3].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
-axs[3].legend()
 
 plt.tight_layout()
 plt.show()
+
 
 
 def find_segments(inarray):
@@ -650,13 +564,15 @@ for i in range(len(output_binary)):
 
 plt.figure(figsize=(5, 4))
 plt.hist(Acc_all, bins=10, alpha=0.7, color='C0')
+xticks = np.linspace(0.75, 1, 6)
+plt.xticks(xticks, [f'{int(x*100)}%' for x in xticks])
 
-plt.xlabel('Accuracy')
+plt.xlabel('Accuracy (%)')
 plt.ylabel('Frequency')
 plt.title('Accuracy Distribution for Each Sequence')
 plt.axvline(np.mean(Acc_all), color='C1', linestyle='--', label=f'Mean Accuracy: {np.mean(Acc_all):.2f}')
 plt.legend()
-plt.xlim(0., 1)
+plt.xlim(0.75, 1)
 plt.show()
 
 # %%

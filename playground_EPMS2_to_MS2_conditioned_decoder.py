@@ -73,7 +73,7 @@ class JointLoss(nn.Module):
         if target.dim() == 2:
             target = target.unsqueeze(1)
 
-        recon_loss = self.recon_loss_fn(output, target) + 0.01 * self.mask_loss_fn(output)
+        recon_loss = self.recon_loss_fn(output, target)
         mask_loss = self.mask_loss_fn(binary_output)
 
         total = self.alpha * recon_loss + self.beta * mask_loss + 1e-6  
@@ -161,6 +161,8 @@ class UNet1DVariableDecoder(nn.Module):
         self.final_conv = nn.Conv1d(ch, 128, kernel_size=1)
 
     def forward(self, x):
+        x = x[:, :-1, :]
+
         distance = x[:, 3, :].unsqueeze(1)  # shape: (B, 1, T)
         if self.use_DistanceGate_mask:
             distance_signal = self.gate(distance)  # shape: (B, 1, T)
@@ -220,6 +222,38 @@ class CNNReconstructorResidual(nn.Module):
         return x
 
 
+class CNNReconstructorResidualConditioned(nn.Module):
+    def __init__(self, out_channels, output_length, base_channels=64):
+        super().__init__()
+        self.output_length = output_length
+        self.initial_conv = nn.Conv1d(128, base_channels, kernel_size=3, padding=1)
+        self.res_block1 = ResidualBlock1D(base_channels)
+        self.res_block2 = ResidualBlock1D(base_channels)
+        self.signal_proj = nn.Sequential(
+            nn.AdaptiveAvgPool1d(16),     # downsample signal for context
+            nn.Conv1d(1, base_channels, kernel_size=3, padding=1),  # learnable transform
+            nn.ReLU(inplace=True)
+        )
+        self.fusion = nn.Conv1d(2 * base_channels, base_channels, kernel_size=1)
+        self.final_conv1 = nn.Conv1d(base_channels, out_channels, kernel_size=1)
+
+    def forward(self, x, signal_reference):
+        # x: latent mask from U-Net, shape [B, 128, T]
+        x = self.initial_conv(x)            # → [B, base_channels, T]
+        x = self.res_block1(x)
+        x = self.res_block2(x)
+
+        signal_embed = self.signal_proj(signal_reference)  # [B, base_channels, 16]
+        signal_embed = F.interpolate(signal_embed, size=x.size(-1), mode='linear', align_corners=True)
+
+        x = torch.cat([x, signal_embed], dim=1)  # [B, 2*base_channels, T]
+        x = self.fusion(x)  # [B, base_channels, T]
+
+        x = F.interpolate(x, size=self.output_length, mode='linear', align_corners=True)
+        x = self.final_conv1(x)
+        return x
+    
+
 def clear_cuda_memory():
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
@@ -237,11 +271,13 @@ def train_epoch(model_unet, model_decoder, dataloader, optimizer, criterion, dev
         y_batch = y_batch.to(device)
         optimizer.zero_grad()
 
+        signal_input = X_batch[:, -1, :].unsqueeze(1)  # shape: (B, 1, T_in)
+
         output_target = y_batch[:, 0, :]
         state_target = y_batch[:, 1, :]
 
         binary_output = model_unet(X_batch)
-        output = model_decoder(binary_output)
+        output = model_decoder(binary_output, signal_input)
         output = output.clamp(-20, 20)  # logits are raw, keep in safe range
         binary_output = torch.sigmoid(binary_output)
         loss, recon_loss, mask_loss = criterion(output, output_target, binary_output)
@@ -288,11 +324,13 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
         X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
 
+        signal_input = X_batch[:, -1, :].unsqueeze(1)  # shape: (B, 1, T_in)
+
         output_target = y_batch[:, 0, :]
         state_target = y_batch[:, 1, :]
 
         binary_output = model_unet(X_batch)
-        output = model_decoder(binary_output)
+        output = model_decoder(binary_output, signal_input)
         output = output.clamp(-20, 20)  # logits are raw, keep in safe range
 
         binary_output = torch.sigmoid(binary_output)
@@ -316,7 +354,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
             'epoch': epoch,
             'val_loss': total_val_loss
         }
-        torch.save(best_model_state, "best_model_EP_to_MS2.pt")
+        torch.save(best_model_state, "best_model_EPMS2_to_states.pt")
     
     
     last_model_state = {
@@ -326,7 +364,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
             'epoch': epoch,
             'val_loss': total_val_loss
         }
-    torch.save(last_model_state, "last_model_EP_to_MS2.pt")
+    torch.save(last_model_state, "last_model_EPMS2_to_states.pt")
 
     val_preds = torch.cat(val_preds).numpy().flatten()
     val_targets = torch.cat(val_targets).numpy().flatten()
@@ -394,18 +432,19 @@ y = torch.stack(y).to(device)
 X = torch.stack(C).to(device)  # [N, 3, T_in] 
 D = torch.tensor(D, dtype=torch.float32).to(device)  # [N, T_in]
 X = torch.cat((X, D.unsqueeze(1)), dim=1)  # [N, 4, T_in]
+X = torch.cat((X, y.unsqueeze(1)), dim=1)  # [N, 4, T_in]
 
 
 
 print(X.shape, y.shape)
 
-N_in = X.shape[1]   # Number of input channels +1 (for distance gate)
+N_in = X.shape[1]-1   # Number of input channels +1 (for distance gate)
 N_out = 1  # Number of output channels (MS2 signal)
 T_in = y.shape[1]
 model_unet = UNet1DVariableDecoder(N_in, encoder_depth=2, decoder_depth=2, base_channels=8,
                                    init_thresh=0.1, init_alpha=1.0, learn_alpha=False,
                                    use_DistanceGate_mask=False)
-model_decoder = CNNReconstructorResidual(out_channels=N_out, output_length=T_in)
+model_decoder = CNNReconstructorResidualConditioned(out_channels=N_out, output_length=T_in)
 
 model_unet.to(device)
 model_decoder.to(device)
@@ -468,7 +507,7 @@ optimizer = torch.optim.Adam(
 
 
 # ----- Training Loop -----
-num_epochs = 30
+num_epochs = 50
 train_losses = []
 val_losses = []
 
@@ -505,7 +544,7 @@ torch.cuda.empty_cache()
 
 
 print(X_val.shape, y_val.shape)
-checkpoint = torch.load("last_model_EP_to_MS2.pt", map_location='cpu')
+checkpoint = torch.load("last_model_EPMS2_to_states.pt", map_location='cpu')
 model_unet.load_state_dict(checkpoint['model_unet'])
 model_decoder.load_state_dict(checkpoint['model_decoder'])
 
@@ -513,7 +552,7 @@ print("Learned threshold distance:", model_unet.gate.dc.item())
 print("Learned alpha distance:", model_unet.gate.alpha.item())
 
 print(X_val.shape, y_val.shape)
-checkpoint = torch.load("best_model_EP_to_MS2.pt", map_location='cpu')
+checkpoint = torch.load("best_model_EPMS2_to_states.pt", map_location='cpu')
 model_unet.load_state_dict(checkpoint['model_unet'])
 model_decoder.load_state_dict(checkpoint['model_decoder'])
 
@@ -526,19 +565,19 @@ model_decoder.eval()
 model_unet.to('cpu')
 model_decoder.to('cpu')
 
-binary = model_unet(X_test.to('cpu'))  # [B, 1, T_out]
-output = model_decoder(binary.to('cpu'))  # [B, N, T_in]
+binary = model_unet(X_test.to('cpu'))  # [B, 128, T_in]
+output = model_decoder(binary.to('cpu'), X_test[:, -1, :].unsqueeze(1).to('cpu')) 
 binary = torch.sigmoid(binary)  # Apply sigmoid to get probabilities
 output = torch.sigmoid(output)  # Apply sigmoid to get probabilities
 output_binary = output > 0.5  # Apply sigmoid to get probabilities
-binary0 = binary[:,0,:]  # [B, T_out]
+binary0 = binary.squeeze(1)  # [B, T_out]
 output = output.squeeze(1)  # [B, T_in]
 
 
 
 x = torch.arange(0,1,0.01)
 y = torch.sigmoid(model_unet.gate.alpha.item() * (model_unet.gate.dc.item() - x))
-plt.figure(figsize=(8, 4))
+plt.figure(figsize=(5, 4))
 plt.plot(x, y, label='Sigmoid Gate Function')
 plt.axhline(0.5, color='red', linestyle='--', label='Threshold (0.5)')
 plt.xlabel('Distance')
@@ -554,11 +593,15 @@ print(f"X_test shape: {X_test.shape}")
 
 idx_chosen = np.random.randint(0, len(X_val))
 
+output_minmax = output[idx_chosen].cpu().detach().numpy().flatten()
+output_minmax = (output_minmax - output_minmax.min()) / (output_minmax.max() - output_minmax.min())
+
 
 fig, axs = plt.subplots(4,1,figsize=(12, 9))
 
 axs[0].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten(), label='Signal', color='C0')
-axs[0].axhline(0.1, color='k', linestyle='--', label='Activation Threshold')
+axs[0].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under radius', color='k')
+
 #axs[0].plot(X_test[i,4,:].cpu().numpy().flatten(), label='GT State', color='C1')
 axs[0].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 axs[0].set_xlabel("Time")
@@ -566,23 +609,30 @@ axs[0].set_ylabel("Signal Value")
 axs[0].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
 axs[0].legend()
 
-axs[1].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under threshold', color='k')
-axs[1].plot(y_test[idx_chosen,0,:].cpu().numpy().flatten(), label='GT State', color='C1')
+axs[1].plot(X_test[idx_chosen,4,:].cpu().numpy().flatten(), label='Signal', color='C0')
+axs[1].plot(y_test[idx_chosen, 0,:].cpu().numpy().flatten(), label='GT State', color='C1')
 axs[1].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 axs[1].set_xlabel("Time")
 axs[1].set_ylabel("Signal Value")
 axs[1].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
 axs[1].legend()
 
-axs[2].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under threshold', color='k')
-axs[2].plot(y_test[idx_chosen,0,:].cpu().numpy().flatten(), label='GT State', color='C1')
+axs[2].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under radius', color='k')
 axs[2].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[2].plot(output_minmax, label='Pred. State (Min-Max Norm)', color='C3')
+
 axs[2].set_xlabel("Time")
 axs[2].set_ylabel("Signal Value")
 axs[2].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
 axs[2].legend()
 
+axs[3].plot(y_test[idx_chosen, 0,:].cpu().numpy().flatten(), label='GT State', color='C1')
 axs[3].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+
+axs[3].plot(output_minmax, label='Pred. State (Min-Max Norm)', color='C3')
+
+#axs[3].plot(, label='Pred. State', color='C2')
+
 axs[3].set_xlabel("Time")
 axs[3].set_ylabel("Signal Value")
 axs[3].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
@@ -625,7 +675,7 @@ for i in range(len(output_binary)):
 output_binary_seglengths_flat = np.concatenate(output_binary_seglengths)
     
 
-plt.figure(figsize=(10, 4))
+plt.figure(figsize=(5, 4))
 plt.hist(states_all_test_seglengths_flat, bins=100, alpha=0.5, label='GT State Segments')
 plt.hist(output_binary_seglengths_flat, bins=100, alpha=0.5, label='Pred. Binary Segments')
 plt.xlabel('Segment Length')

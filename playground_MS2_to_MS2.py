@@ -12,8 +12,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class EntropyLoss(nn.Module):
+class SharpnessLoss(nn.Module):
     def __init__(self, epsilon=1e-8):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, pred):
+        if pred.dim() == 3:
+            pred = pred.squeeze(1)
+        p = pred.clamp(self.epsilon, 1. - self.epsilon)
+        entropy = - (p * torch.log(p) + (1 - p) * torch.log(1 - p))
+        return -entropy.mean()  # maximize sharpness
+
+
+class EntropyLoss(nn.Module):
+    def __init__(self, epsilon=1e-6):
         super().__init__()
         self.epsilon = epsilon
 
@@ -55,43 +68,28 @@ class JointLoss(nn.Module):
     def __init__(self, 
                  recon_loss_fn=nn.MSELoss(),
                  mask_loss_fn=NormalizedCutLoss(k=2),
-                 state_loss_fn=nn.BCEWithLogitsLoss(),
                  alpha=1.0,
-                 beta=1.0,
-                 gamma=0.1
-                 ):
+                 beta=0.1):
         super().__init__()
         self.recon_loss_fn = recon_loss_fn
-        self.state_loss_fn = state_loss_fn
         self.mask_loss_fn = mask_loss_fn
         self.alpha = alpha
         self.beta = beta
-        self.gamma = gamma
 
-    def forward(self, time_values, states, time_target, states_target, binary_output):
+    def forward(self, output, target, binary_output):
         """
         output: model_decoder(binary_output) => shape (B, 1, T)
         target: ground truth => shape (B, T) or (B, 1, T)
         binary_output: output from model_unet => shape (B, 1, T)
         """
-        if time_target.dim() == 3:
-            time_target = time_target.squeeze(1)  # shape (B, T)
-        if states_target.dim() == 3:
-            states_target = states_target.squeeze(1)  # shape (B, T)
+        if target.dim() == 2:
+            target = target.unsqueeze(1)
 
-        if time_values.dim() == 3:
-            time_values = time_values.squeeze(1)
-        if states.dim() == 3:
-            states = states.squeeze(1)
-
-        recon_loss = self.recon_loss_fn(time_values, time_target)
-        state_loss = self.state_loss_fn(states, states_target.squeeze(1))
+        recon_loss = self.recon_loss_fn(output, target)
         mask_loss = self.mask_loss_fn(binary_output)
 
-        print(f"Recon Loss: {recon_loss.item()}, State Loss: {state_loss.item()}, Mask Loss: {mask_loss.item()}")
-
-        total = self.alpha * recon_loss + self.beta * state_loss + self.gamma * mask_loss
-        return total, recon_loss, state_loss, mask_loss
+        total = self.alpha * recon_loss + self.beta * mask_loss
+        return total, recon_loss, mask_loss
     
 
 class ConvBlock1D(nn.Module):
@@ -192,7 +190,7 @@ class CNNReconstructorResidual(nn.Module):
         self.initial_conv = nn.Conv1d(1, base_channels, kernel_size=3, padding=1)
         self.res_block1 = ResidualBlock1D(base_channels)
         self.res_block2 = ResidualBlock1D(base_channels)
-        self.final_conv = nn.Conv1d(base_channels, out_channels, kernel_size=1)
+        self.final_conv1 = nn.Conv1d(base_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
         # x shape: [B, 1, T_out]
@@ -202,8 +200,7 @@ class CNNReconstructorResidual(nn.Module):
 
         # Downsample/interpolate to T_in at the very end
         x = F.interpolate(x, size=self.output_length, mode='linear', align_corners=True)  # [B, out_channels, T_in]
-        x = self.final_conv(x)      # [B, out_channels, T_out]
-
+        x = self.final_conv1(x)      # [B, out_channels, T_out]
         return x
 
 
@@ -268,15 +265,11 @@ y = torch.stack(y)
 print(X.shape, y.shape)
 
 B, N, T_in = 8, 1, y.shape[1]
-model_unet = UNet1DVariableDecoder(N, encoder_depth=2, decoder_depth=2, base_channels=16)
-model_unet1 = UNet1DVariableDecoder(N, encoder_depth=2, decoder_depth=2, base_channels=16)
-
-model_decoder = CNNReconstructorResidual(out_channels=1, output_length=T_in)
-model_state = CNNReconstructorResidual(out_channels=1, output_length=T_in)
+model_unet = UNet1DVariableDecoder(N, encoder_depth=2, decoder_depth=2, base_channels=2)
+model_decoder = CNNReconstructorResidual(out_channels=N, output_length=T_in)
 
 model_unet.to(device)
 model_decoder.to(device)
-model_state.to(device)
 
 # Train/val split
 X_idx = np.arange(len(X))
@@ -294,14 +287,17 @@ y_test = y[X_test_idx].to(device)    # [N_test, T_in
 states_all_train = [fulltime_padded_states_all[i] for i in X_train_idx]
 states_all_val = [fulltime_padded_states_all[i] for i in X_val_idx]
 states_all_test = [fulltime_padded_states_all[i] for i in X_test_idx]
+states_all_train = torch.tensor(states_all_train, dtype=torch.float32).to(device)  # [N_train, T_out]
+states_all_val = torch.tensor(states_all_val, dtype=torch.float32).to(device)      # [N_val, T_out]
+states_all_test = torch.tensor(states_all_test, dtype=torch.float32).to(device)    # [N_test, T_out]
 
-y_train = torch.cat([y_train.unsqueeze(1), torch.tensor(states_all_train, dtype=torch.float32).unsqueeze(1).to(device)], dim=1)  # [N_train, 2, T_in]
-y_val = torch.cat([y_val.unsqueeze(1), torch.tensor(states_all_val, dtype=torch.float32).unsqueeze(1).to(device)], dim=1)      # [N_val, 2, T_in]
-y_test = torch.cat([y_test.unsqueeze(1), torch.tensor(states_all_test, dtype=torch.float32).unsqueeze(1).to(device)], dim=1)    # [N_test, 2, T_in]
+num_pos_train = torch.sum(states_all_train > 0.5).item()  # Count positive states
+num_neg_train = torch.sum(states_all_train < 0.5).item()  # Count positive states
+pos_weight_train = num_neg_train / num_pos_train
 
-num_neg_train = sum([np.sum(states_all_train[i] == 0) for i in range(len(states_all_train))])
-num_pos_train = sum([np.sum(states_all_train[i] == 1) for i in range(len(states_all_train))])
-pos_weight = num_neg_train / num_pos_train
+y_train = torch.stack([y_train, states_all_train], dim=1)  # [N_train, 2, T_in]
+y_val = torch.stack([y_val, states_all_val], dim=1)      # [N_val, 2, T_in]
+y_test = torch.stack([y_test, states_all_test], dim=1)    # [N_test, 2, T_in]
 
 # Create Datasets
 train_dataset = TensorDataset(X_train, y_train)
@@ -315,15 +311,17 @@ val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 criterion = nn.BCEWithLogitsLoss()
 criterion = nn.MSELoss()
 
+print('I could do a warm start where the model can go nuts of reconstruction and model isnt penalized for mask but then slowly amp up mask loss')
 criterion = JointLoss(
     recon_loss_fn=nn.MSELoss(),
-    state_loss_fn=nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device)),
-    mask_loss_fn=EntropyLoss(),
+    mask_loss_fn=EntropyLoss(),  # or EntropyLoss(), SharpnessLoss() or NormalizedCutLoss(k=2)
     #mask_loss_fn=NormalizedCutLoss(k=2),
     alpha=1.0,
-    beta=1.0,
-    gamma=0.1
+    beta=0.05
 )
+
+state_loss_criterion = nn.BCEWithLogitsLoss(
+    pos_weight=torch.tensor([pos_weight_train]).to(device))
 
 optimizer = torch.optim.Adam(
     list(model_unet.parameters()) + list(model_decoder.parameters()),
@@ -331,7 +329,7 @@ optimizer = torch.optim.Adam(
 
 val_losses = []
 train_losses = []
-for epoch in trange(5, desc="Training"):
+for epoch in trange(10, desc="Training"):
     model_unet.train()
     model_decoder.train()
 
@@ -340,32 +338,28 @@ for epoch in trange(5, desc="Training"):
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
 
-        y_time_values = y_batch[:, 0, :]  # [B, T_in]
-        y_states = y_batch[:, 1, :]  # [B, T_in]
+        output_target = y_batch[:, 0, :]
+        state_target = y_batch[:, 1, :]
 
         # Forward pass through UNet (outputs binary mask)
         binary_output = model_unet(X_batch)  # [B, 1, T_out]
-        binary_output1 = model_unet1(X_batch)  # [B, 1, T_out]
         
         if i==10:
             print(np.unique(np.round(torch.flatten(binary_output).detach().cpu().numpy()), return_counts=True))
 
         # Forward pass through CNN reconstructor
-        MS2_pred = model_decoder(binary_output)  # [B, N, T_in]
-        state_pred = model_state(binary_output1)  # [B, N, T_in]
+        output = model_decoder(binary_output)  # [B, N, T_in]
 
         # Compute reconstruction loss only on recon vs input
-        loss, recon_loss, state_loss, mask_loss = criterion(MS2_pred, state_pred, 
-                                                            y_time_values, y_states,
-                                                            binary_output)
+        loss, recon_loss, cut_loss = criterion(output, output_target, binary_output)
 
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
 
-        del binary_output, MS2_pred, state_pred # Clear memory
+        del binary_output, output, output_target  # Clear memory
         del X_batch, y_batch  # Clear memory
-        del loss, recon_loss, state_loss, mask_loss  # Clear memory
+        del loss, recon_loss, cut_loss  # Clear memory
         torch.cuda.empty_cache()  # Clear GPU memory
         torch.cuda.ipc_collect()  # Collect IPC memory
 
@@ -375,35 +369,39 @@ for epoch in trange(5, desc="Training"):
     model_unet.eval()
     model_decoder.eval()
 
+    val_preds = []
+    val_targets = []
     val_loss_total = 0.0
     with torch.no_grad():
         for X_batch, y_batch in val_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
-            y_time_values = y_batch[:, 0, :]  # [B, T_in]
-            y_states = y_batch[:, 1, :]  # [B, T_in]
+            output_target = y_batch[:, 0, :]
+            state_target = y_batch[:, 1, :]
 
             # Forward pass through UNet (outputs binary mask)
             binary_output = model_unet(X_batch)  # [B, 1, T_out]
 
             # Forward pass through CNN reconstructor
-            MS2_pred = model_decoder(binary_output)  # [B, N, T_in]
-            state_pred = model_state(binary_output)  # [B, N, T_in]
+            val_output = model_decoder(binary_output)  # [B, N, T_in]
 
             # Compute reconstruction loss only on recon vs input
-            loss, recon_loss, state_loss, mask_loss = criterion(MS2_pred, state_pred, 
-                                                                y_time_values, y_states,
-                                                                binary_output)
-
+            loss, recon_loss, cut_loss = criterion(val_output, output_target, binary_output)
+            
             val_loss_total += loss
+            val_preds.append(torch.sigmoid(val_output).squeeze(-1).cpu())
+            val_targets.append(output_target.cpu())
 
-            del binary_output, MS2_pred, state_pred  # Clear memory
-            del X_batch, y_batch  # Clear memory
-            del loss, recon_loss, state_loss, mask_loss  # Clear memory
+            del binary_output, val_output  # Clear memory
+            del X_batch, y_batch, output_target  # Clear memory
+            del loss, recon_loss, cut_loss  # Clear memory
             torch.cuda.empty_cache()  # Clear GPU memory
             torch.cuda.ipc_collect()  # Collect IPC memory
 
+    val_preds = torch.cat(val_preds).numpy().flatten()
+    val_targets = torch.cat(val_targets).numpy().flatten()
     val_loss = val_loss_total / len(val_loader)
+
     val_losses.append(val_loss)
 
 
@@ -414,11 +412,8 @@ torch.cuda.empty_cache()
 torch.cuda.ipc_collect()
 
 
-
 # %%
-torch.cuda.empty_cache()
 
-print(X_val.shape, y_val.shape)
 
 model_unet.eval()
 model_decoder.eval()
@@ -427,52 +422,42 @@ model_decoder.to('cpu')
 
 binary = model_unet(X_test.to('cpu'))  # [B, 1, T_out]
 output = model_decoder(binary.to('cpu'))  # [B, N, T_in]
-binary = binary.squeeze(1)  # [B, T_out]
-MS2_pred = output[:,0,:]  # [B, T_in]
-state_pred = output[:,1,:]  # [B, T_in]
+binary0 = binary.squeeze(1)  # [B, T_out]
+output = output.squeeze(1)  # [B, T_in]
 
 
-# %%
-
-print(f"Binary output shape: {binary.shape}")
-print(f"Output shape: {MS2_pred.shape}")
+print(f"Binary output shape: {binary0.shape}")
+print(f"Output shape: {output.shape}")
 # plot some outputs versus targets
 
 i = np.random.randint(0, len(X_val))
 
 
-fig, axs = plt.subplots(4,1,figsize=(10, 9))
+fig, axs = plt.subplots(3,1,figsize=(10, 9))
 
 axs[0].plot(X_test[i].cpu().numpy().flatten(), label='Input', color='C0')
-axs[0].plot(MS2_pred[i].cpu().detach().numpy(), label='Output', color='C1')
-axs[0].plot(binary[i].cpu().detach().numpy().flatten(), label='Binary', color='C2')
+axs[0].plot(output[i].cpu().detach().numpy(), label='Output', color='C1')
+axs[0].plot(binary0[i].cpu().detach().numpy().flatten(), label='Binary', color='C2')
 axs[0].set_title(f"Predicted + Binary sequence vs Input X_test {i+1}")
 axs[0].set_ylabel("Signal Value")
 axs[0].set_xlabel("Time")
 axs[0].legend()
 
 
-axs[1].plot(MS2_pred[i].cpu().detach().numpy(), label='Output', color='C1')
-axs[1].plot(1-binary[i].cpu().detach().numpy().flatten(), label='flip. Binary', color='C2')
+axs[1].plot(binary0[i].cpu().detach().numpy().flatten(), label='flip. Binary', color='C2')
+axs[1].plot(states_all_test[i].cpu().numpy().flatten(), label='State', color='C0')
 axs[1].set_xlabel("Time")
 axs[1].set_ylabel("Signal Value")
-axs[1].set_title(f"Output vs Binary sequence for X_test {i+1}")
+axs[1].set_title(f"Residual of Output vs Binary sequence for X_test {i+1}")
 axs[1].legend()
 
-axs[2].plot(states_all_test[i], label='Fulltime padded states', color='C5')
-axs[2].plot(1-binary[i].cpu().detach().numpy().flatten(), label='flip. Binary', color='C2')
+
+axs[2].plot(binary0[i].cpu().detach().numpy().flatten(), label='flip. Binary', color='C2')
 axs[2].set_xlabel("Time")
 axs[2].set_ylabel("Signal Value")
-axs[2].set_title(f"Residual of Output vs Binary sequence for X_test {i+1}")
+axs[2].set_title(f"Residual of X_test vs Binary sequence for X_test {i+1}")
 axs[2].legend()
-
-
-axs[3].plot(-MS2_pred[i].cpu().detach().numpy()[:-1]+(1-binary[i].cpu().detach().numpy().flatten()), label='Residual B-O', color='C3')
-axs[3].plot(-X_test[i].cpu().numpy().flatten()[:-1]+(1-binary[i].cpu().detach().numpy().flatten()), label='Residual X-O', color='C4')
-axs[3].set_xlabel("Time")
-axs[3].set_ylabel("Signal Value")
-axs[3].set_title(f"Residual of X_test vs Binary sequence for X_test {i+1}")
-axs[3].legend()
 
 plt.tight_layout()
 plt.show()
+# %%

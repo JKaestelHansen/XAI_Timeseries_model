@@ -244,7 +244,7 @@ def train_epoch(model_unet, model_decoder, dataloader, optimizer, criterion, dev
         output = model_decoder(binary_output)
         output = output.clamp(-20, 20)  # logits are raw, keep in safe range
         binary_output = torch.sigmoid(binary_output)
-        loss, recon_loss, mask_loss = criterion(output, output_target, binary_output)
+        loss, recon_loss, mask_loss = criterion(output, state_target, binary_output)
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"⚠️ NaN/Inf detected in loss at batch {i}. Skipping update.")
@@ -296,7 +296,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
         output = output.clamp(-20, 20)  # logits are raw, keep in safe range
 
         binary_output = torch.sigmoid(binary_output)
-        val_loss, _, _ = criterion(output, output_target, binary_output)
+        val_loss, _, _ = criterion(output, state_target, binary_output)
 
         total_loss += val_loss.item()
         val_preds.append(torch.sigmoid(output).squeeze(1).cpu())
@@ -316,7 +316,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
             'epoch': epoch,
             'val_loss': total_val_loss
         }
-        torch.save(best_model_state, "best_model_EP_to_MS2.pt")
+        torch.save(best_model_state, "best_model_EP_to_states.pt")
     
     
     last_model_state = {
@@ -326,7 +326,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
             'epoch': epoch,
             'val_loss': total_val_loss
         }
-    torch.save(last_model_state, "last_model_EP_to_MS2.pt")
+    torch.save(last_model_state, "last_model_EP_to_states.pt")
 
     val_preds = torch.cat(val_preds).numpy().flatten()
     val_targets = torch.cat(val_targets).numpy().flatten()
@@ -452,7 +452,8 @@ criterion = nn.BCEWithLogitsLoss()
 criterion = nn.MSELoss()
 
 criterion = JointLoss(
-    recon_loss_fn=nn.MSELoss(),
+    recon_loss_fn=nn.BCEWithLogitsLoss(
+    pos_weight=torch.tensor([pos_weight_train]).to(device)),
     mask_loss_fn=EntropyLoss(),
     #mask_loss_fn=NormalizedCutLoss(k=2),
     alpha=1.0,
@@ -505,7 +506,7 @@ torch.cuda.empty_cache()
 
 
 print(X_val.shape, y_val.shape)
-checkpoint = torch.load("last_model_EP_to_MS2.pt", map_location='cpu')
+checkpoint = torch.load("last_model_EP_to_states.pt", map_location='cpu')
 model_unet.load_state_dict(checkpoint['model_unet'])
 model_decoder.load_state_dict(checkpoint['model_decoder'])
 
@@ -513,7 +514,7 @@ print("Learned threshold distance:", model_unet.gate.dc.item())
 print("Learned alpha distance:", model_unet.gate.alpha.item())
 
 print(X_val.shape, y_val.shape)
-checkpoint = torch.load("best_model_EP_to_MS2.pt", map_location='cpu')
+checkpoint = torch.load("best_model_EP_to_states.pt", map_location='cpu')
 model_unet.load_state_dict(checkpoint['model_unet'])
 model_decoder.load_state_dict(checkpoint['model_decoder'])
 
@@ -567,22 +568,23 @@ axs[0].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+
 axs[0].legend()
 
 axs[1].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under threshold', color='k')
-axs[1].plot(y_test[idx_chosen,0,:].cpu().numpy().flatten(), label='GT State', color='C1')
-axs[1].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[1].plot(states_all_test[idx_chosen].cpu().numpy().flatten(), label='GT State', color='C1')
+axs[1].plot(output_binary[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 axs[1].set_xlabel("Time")
 axs[1].set_ylabel("Signal Value")
 axs[1].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
 axs[1].legend()
 
 axs[2].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under threshold', color='k')
-axs[2].plot(y_test[idx_chosen,0,:].cpu().numpy().flatten(), label='GT State', color='C1')
+axs[2].plot(states_all_test[idx_chosen].cpu().numpy().flatten(), label='GT State', color='C1')
 axs[2].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 axs[2].set_xlabel("Time")
 axs[2].set_ylabel("Signal Value")
 axs[2].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
 axs[2].legend()
 
-axs[3].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[3].plot(states_all_test[idx_chosen].cpu().numpy().flatten(), label='GT State', color='C1')
+axs[3].plot(output_binary[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 axs[3].set_xlabel("Time")
 axs[3].set_ylabel("Signal Value")
 axs[3].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
