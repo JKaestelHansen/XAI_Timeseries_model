@@ -5,10 +5,18 @@ The goal is to learn Y (MS2 intensities, binds nascant RNA to visualize transcri
 
 Main playground scripts:
 
-playground_EPMS2_to_states.py
+playground_EP_to_MS2_XAI.py
+- WIP
+- Explores mapping from EP to MS2
+- In Unet we mask all XY input where EP is not under a learned Parameter (proxy for contact radius). The idea being that enhancer promoter occur under some contact radius so all useful information should be under this threshold and having it as a learnable parameter we get an estimate from the model.
+- Even if one feeds Y as input with the masking using the learned Parameter for contact radius then due to masking using distance the model cant see Y completely and just copy but it does help prediction
+  - accuracy of learned contact radius is sensitive to loss function and regularization but it works surprisingly well
+
+playground_EPMS2_to_MS2.py
 - Explores mapping XY to Y using a Unet and resnet style decoder. In Unet we mask all XY input where EP is not under a learned Parameter (proxy for contact radius). The idea being that enhancer promoter occur under some contact radius so all useful information should be under this threshold and having it as a learnable parameter we get an estimate from the model.
 Learnings:
 - accuracy of learned contact radius is sensitive to loss function and regularization but it works surprisingly well
+- without signal as input and/or without gating on contact radius the model still seems to pick up trends
 
 <img width="1189" height="889" alt="image" src="https://github.com/user-attachments/assets/6aa76dec-b3f9-4a67-9051-abf32ade93d5" />
 
