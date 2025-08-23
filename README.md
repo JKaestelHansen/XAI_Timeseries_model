@@ -17,7 +17,7 @@ Learnings:
 WIP / exploratory / dropped:
 
 playground_MS2_to_MS2_VAEstyle.py
-- Explores self-supervised task of encoding and reconstructing Y VAE-style. Unet encoder to a Bernoulli random variable. Resnet style decoder. Convolutions can be toggled between causual or standard.
+- Explores self-supervised task of encoding and reconstructing Y VAE-style. Unet encoder to a Bernoulli random variable. Resnet style decoder. Convolutions can be toggled between causual or standard. Investigated whether upsampling the latent space so it was larger than output could function as a more fine-grained time-resolution where model could place 1s. Checked if these 1s aligned with pol2 loading or other biology - needs more exploration.
 
 playground_EPMS2_to_MS2_conditioned_decoder.py
 - Explores mapping XY to Y using a Unet masking everything under a learned Parameter (proxy for contact radius), feeding Y to decoder to condition to aid in reconstruction.
