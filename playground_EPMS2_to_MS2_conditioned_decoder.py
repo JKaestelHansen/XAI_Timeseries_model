@@ -354,7 +354,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
             'epoch': epoch,
             'val_loss': total_val_loss
         }
-        torch.save(best_model_state, "best_model_EPMS2_to_states.pt")
+        torch.save(best_model_state, "best_model_EPMS2conditioned_to_MS2.pt")
     
     
     last_model_state = {
@@ -364,7 +364,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
             'epoch': epoch,
             'val_loss': total_val_loss
         }
-    torch.save(last_model_state, "last_model_EPMS2_to_states.pt")
+    torch.save(last_model_state, "last_model_EPMS2conditioned_to_MS2.pt")
 
     val_preds = torch.cat(val_preds).numpy().flatten()
     val_targets = torch.cat(val_targets).numpy().flatten()
@@ -375,7 +375,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-with open('data/dataset_for_Jacob.pkl', 'rb') as f:
+with open('_data/dataset_for_Jacob.pkl', 'rb') as f:
     data = pickle.load(f)
 
 C = []
@@ -442,8 +442,8 @@ N_in = X.shape[1]-1   # Number of input channels +1 (for distance gate)
 N_out = 1  # Number of output channels (MS2 signal)
 T_in = y.shape[1]
 model_unet = UNet1DVariableDecoder(N_in, encoder_depth=2, decoder_depth=2, base_channels=8,
-                                   init_thresh=0.1, init_alpha=1.0, learn_alpha=False,
-                                   use_DistanceGate_mask=False)
+                                   init_thresh=0.1, init_alpha=100.0, learn_alpha=False,
+                                   use_DistanceGate_mask=True)
 model_decoder = CNNReconstructorResidualConditioned(out_channels=N_out, output_length=T_in)
 
 model_unet.to(device)
@@ -544,15 +544,7 @@ torch.cuda.empty_cache()
 
 
 print(X_val.shape, y_val.shape)
-checkpoint = torch.load("last_model_EPMS2_to_states.pt", map_location='cpu')
-model_unet.load_state_dict(checkpoint['model_unet'])
-model_decoder.load_state_dict(checkpoint['model_decoder'])
-
-print("Learned threshold distance:", model_unet.gate.dc.item())
-print("Learned alpha distance:", model_unet.gate.alpha.item())
-
-print(X_val.shape, y_val.shape)
-checkpoint = torch.load("best_model_EPMS2_to_states.pt", map_location='cpu')
+checkpoint = torch.load("best_model_EPMS2conditioned_to_MS2.pt", map_location='cpu')
 model_unet.load_state_dict(checkpoint['model_unet'])
 model_decoder.load_state_dict(checkpoint['model_decoder'])
 

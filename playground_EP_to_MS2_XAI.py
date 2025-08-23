@@ -12,6 +12,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class CalibratedGaussianNLL(nn.Module):
+    def __init__(self, lambda_var=1e-4,   # strength on variance penalty
+                 target_logvar=None,      # e.g. math.log(estimated_noise**2) or None
+                 lambda_prior=0.0,        # strength toward target_logvar
+                 clip_logvar=(-10.0, 10.0),
+                 warmup_steps=0,          # no var penalty until this step
+                 total_steps=100000):     # for smooth annealing if you want
+        super().__init__()
+        self.lambda_var = lambda_var
+        self.target_logvar = target_logvar
+        self.lambda_prior = lambda_prior
+        self.clip_logvar = clip_logvar
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.register_buffer("step", torch.zeros((), dtype=torch.long))
+
+    def forward(self, mean, logvar, y):
+        # Core NLL
+        logvar = torch.clamp(logvar, *self.clip_logvar)
+        var = torch.exp(logvar)
+        nll = 0.5 * (logvar + (y - mean)**2 / var)
+
+        # Cosine anneal multiplier from 0 -> 1 after warmup
+        self.step += 1
+        t = (self.step.item() - self.warmup_steps) / max(1, (self.total_steps - self.warmup_steps))
+        anneal = 0.0 if self.step.item() < self.warmup_steps else 0.5 * (1 - torch.cos(torch.tensor(min(max(t,0.0),1.0) * 3.1415926535)))
+
+        # Penalize large variance (pushes toward certainty unless errors justify it)
+        var_penalty = self.lambda_var * torch.exp(logvar)
+
+        # Optional prior toward a target log-variance (helps avoid trivial inflation)
+        if self.target_logvar is not None and self.lambda_prior > 0:
+            prior_penalty = self.lambda_prior * (logvar - self.target_logvar)**2
+        else:
+            prior_penalty = 0.0
+
+        loss = nll + anneal * (var_penalty + prior_penalty)
+        return loss.mean()
+    
+
+def gaussian_nll_loss(y_pred_mean, y_pred_logvar, y_true):
+    # y_pred_mean, y_pred_logvar: [B, 1, T]
+    var = torch.exp(y_pred_logvar)
+    return 0.5 * (y_pred_logvar + (y_true - y_pred_mean) ** 2 / var)
+
+
 class EntropyLoss(nn.Module):
     def __init__(self, epsilon=1e-6):
         super().__init__()
@@ -52,32 +98,19 @@ class NormalizedCutLoss(nn.Module):
         return min_dists.mean() 
 
 
-class JointLoss(nn.Module):
-    def __init__(self, 
-                 recon_loss_fn=nn.MSELoss(),
-                 mask_loss_fn=NormalizedCutLoss(k=2),
-                 alpha=1.0,
-                 beta=0.1):
+class ResidualBlock1D(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        self.recon_loss_fn = recon_loss_fn
-        self.mask_loss_fn = mask_loss_fn
-        self.alpha = alpha
-        self.beta = beta
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
 
-    def forward(self, output, target, binary_output):
-        """
-        output: model_decoder(binary_output) => shape (B, 1, T)
-        target: ground truth => shape (B, T) or (B, 1, T)
-        binary_output: output from model_unet => shape (B, 1, T)
-        """
-        if target.dim() == 2:
-            target = target.unsqueeze(1)
-
-        recon_loss = self.recon_loss_fn(output, target)
-        mask_loss = self.mask_loss_fn(binary_output)
-
-        total = self.alpha * recon_loss + self.beta * mask_loss + 1e-6  
-        return total, recon_loss, mask_loss
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.conv2(out)
+        return self.relu(out + residual)
     
 
 class ConvBlock1D(nn.Module):
@@ -112,7 +145,7 @@ class DistanceGate(nn.Module):
 
 class UNet1DVariableDecoder(nn.Module):
     def __init__(self, in_channels, encoder_depth=4, decoder_depth=6, base_channels=64,
-                 init_thresh=0.1, init_alpha=10.0, learn_alpha=False,
+                 init_thresh=0.1, init_alpha=10.0, learn_alpha=False, output_length=601,
                  use_DistanceGate_mask=True):
         super().__init__()
         assert decoder_depth >= encoder_depth, "Decoder must be at least as deep as encoder"
@@ -160,16 +193,23 @@ class UNet1DVariableDecoder(nn.Module):
 
         self.final_conv = nn.Conv1d(ch, 128, kernel_size=1)
 
+
+        self.output_length = output_length
+        self.initial_conv = nn.Conv1d(128, 64, kernel_size=3, padding=1)
+        self.res_block1 = ResidualBlock1D(64)
+        self.res_block2 = ResidualBlock1D(64)
+        self.final_conv1 = nn.Conv1d(64, 2, kernel_size=1)
+
     def forward(self, x):
         signal = x[:, -1, :].unsqueeze(1).detach()  # shape: (B, 1, T)
         others = x[:, :-1, :]  # shape: (B, C-1, T)
-        x = torch.cat((others, signal), dim=1)  # shape: (B, C, T)
         distance = x[:, 3, :].unsqueeze(1)  # shape: (B, 1, T)
+        x = torch.cat((others, signal), dim=1)  # shape: (B, C, T)
         if self.use_DistanceGate_mask:
             distance_signal = self.gate(distance)  # shape: (B, 1, T)
-            x *= distance_signal  # Apply gate to input
+            x *= distance_signal   # Apply gate to input
         else:
-            distance_signal = torch.ones_like(distance)
+            distance_signal = torch.zeros_like(distance)
 
         encs = []
         for down in self.downs:
@@ -186,43 +226,24 @@ class UNet1DVariableDecoder(nn.Module):
                 x = torch.cat([x, skip], dim=1)
             x = self.reduce_channels[i](x)
 
-        out = self.final_conv(x)
-        return out, distance_signal  # Return both output and distance signal
-    
-
-class ResidualBlock1D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.relu(out)
-        out = self.conv2(out)
-        return self.relu(out + residual)
-
-class CNNReconstructorResidual(nn.Module):
-    def __init__(self, out_channels, output_length, base_channels=64):
-        super().__init__()
-        self.output_length = output_length
-        self.initial_conv = nn.Conv1d(128, base_channels, kernel_size=3, padding=1)
-        self.res_block1 = ResidualBlock1D(base_channels)
-        self.res_block2 = ResidualBlock1D(base_channels)
-        self.final_conv1 = nn.Conv1d(base_channels, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # x shape: [B, 1, T_out]
+        # output
+        x = self.final_conv(x)
         x = self.initial_conv(x)    # [B, C, T_out]
         x = self.res_block1(x)      # [B, C, T_out]
         x = self.res_block2(x)      # [B, C, T_out]
 
         # Downsample/interpolate to T_in at the very end
         x = F.interpolate(x, size=self.output_length, mode='linear', align_corners=True)  # [B, out_channels, T_in]
-        x = self.final_conv1(x)      # [B, out_channels, T_out]
-        return x
+        out = self.final_conv1(x)      # [B, out_channels, T_out]
+        mean = out[:, 0:1, :]       # [B, 1, T_out]
+        s = out[:, 1:2, :]     # [B, 1, T_out]
+        var = F.softplus(s) + 1e-6
+        logvar = torch.log(var)
+        logvar = torch.clamp(logvar, min=-10, max=10)
+
+        del x
+        return mean, logvar, distance_signal  # Return both output and distance signal
+    
 
 
 def clear_cuda_memory():
@@ -230,73 +251,63 @@ def clear_cuda_memory():
     torch.cuda.ipc_collect()
 
 
-def train_epoch(model_unet, model_decoder, dataloader, optimizer, criterion, device):
+def train_epoch(model_unet, dataloader, optimizer, criterion, device):
     model_unet.train()
-    model_decoder.train()
+    
     total_loss = 0
     total_recon_loss = 0
     total_mask_loss = 0
     total_distance_signal_loss = 0
-
     for i, (X_batch, y_batch) in enumerate(dataloader):
         X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
         optimizer.zero_grad()
 
         output_target = y_batch[:, 0, :]
-        state_target = y_batch[:, 1, :]
+        if output_target.dim() == 2:
+            output_target = output_target.unsqueeze(1)
 
-        binary_output, distance_signal = model_unet(X_batch)
+        mean, logvar, distance_signal = model_unet(X_batch)
+        mean = mean.clamp(-20, 20)  # logits are raw, keep in safe range
         if model_unet.use_DistanceGate_mask:
             # do sparsity loss on distance_signal
             loss_distance_signal = torch.mean(distance_signal)
-            loss_distance_signal *= 0.5
+            loss_distance_signal *= 4
             total_distance_signal_loss += loss_distance_signal.item()
 
+        sigmoid_mean = torch.sigmoid(mean)
+        loss_entropy = 0.1 * EntropyLoss()(sigmoid_mean)
 
-        output = model_decoder(binary_output)
-        output = output.clamp(-20, 20)  # logits are raw, keep in safe range
-        binary_output = torch.sigmoid(binary_output)
-
-        loss, recon_loss, mask_loss = criterion(output, output_target, binary_output)
-
+        loss = criterion(mean, output_target) + 1e-6  
+        #loss = criterion(mean, logvar, output_target).mean() #+ loss_entropy
         loss += loss_distance_signal if model_unet.use_DistanceGate_mask else 0
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"⚠️ NaN/Inf detected in loss at batch {i}. Skipping update.")
-
             # print output and binary where nan or inf is detected
-            if torch.isnan(recon_loss).any() or torch.isinf(recon_loss).any():
-                print(f"⚠️ NaN/Inf detected in recon_loss at batch {i}.")
-            if torch.isnan(mask_loss).any() or torch.isinf(mask_loss).any():
-                print(f"⚠️ NaN/Inf detected in mask_loss at batch {i}.")
             clear_cuda_memory()
             continue
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model_unet.parameters(), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(model_decoder.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
-        total_recon_loss += recon_loss.item()
-        total_mask_loss += mask_loss.item()
 
-        del X_batch, y_batch, binary_output, output
-        del loss, recon_loss, mask_loss
+        del X_batch, y_batch, mean, logvar
         clear_cuda_memory()
 
     return total_loss / len(dataloader), total_recon_loss / len(dataloader), total_mask_loss / len(dataloader), total_distance_signal_loss / len(dataloader)
 
 
 @torch.no_grad()
-def validate_epoch(model_unet, model_decoder, dataloader, criterion, 
+def validate_epoch(model_unet, dataloader, criterion, 
                    best_val_loss=float('inf'), best_model_state=None,
                    device='cpu'):
     model_unet.eval()
-    model_decoder.eval()
 
     total_loss = 0
+    total_distance_signal_loss = 0
     val_preds = []
     val_targets = []
 
@@ -305,21 +316,30 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
         y_batch = y_batch.to(device)
 
         output_target = y_batch[:, 0, :]
-        state_target = y_batch[:, 1, :]
+        if output_target.dim() == 2:
+            output_target = output_target.unsqueeze(1)
 
-        binary_output, distance_signal = model_unet(X_batch)
-        output = model_decoder(binary_output)
-        output = output.clamp(-20, 20)  # logits are raw, keep in safe range
+        mean, logvar, distance_signal = model_unet(X_batch)
 
-        binary_output = torch.sigmoid(binary_output)
-        val_loss, _, _ = criterion(output, output_target, binary_output)
+        sigmoid_mean = torch.sigmoid(mean)
+        loss_entropy = 0.1 * EntropyLoss()(sigmoid_mean)
 
-        total_loss += val_loss.item()
-        val_preds.append(torch.sigmoid(output).squeeze(1).cpu())
+        if model_unet.use_DistanceGate_mask:
+            # do sparsity loss on distance_signal
+            loss_distance_signal = torch.mean(distance_signal)
+            loss_distance_signal *= 4
+            total_distance_signal_loss += loss_distance_signal.item()
+
+        loss = criterion(mean, output_target)
+        #loss = criterion(mean, logvar, output_target).mean() #+ loss_entropy
+        loss += loss_distance_signal if model_unet.use_DistanceGate_mask else 0
+
+        total_loss += loss.item()
+        val_preds.append(torch.sigmoid(mean).squeeze(1).cpu())
         val_targets.append(output_target.cpu())
 
         clear_cuda_memory()
-        del X_batch, y_batch, binary_output, output, val_loss
+        del X_batch, y_batch, mean, logvar
 
     total_val_loss = total_loss / len(dataloader)
     if total_val_loss < best_val_loss:
@@ -327,7 +347,6 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
         best_val_loss = total_val_loss
         best_model_state = {
             'model_unet': model_unet.state_dict(),
-            'model_decoder': model_decoder.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
             'val_loss': total_val_loss
@@ -337,7 +356,6 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
     
     last_model_state = {
             'model_unet': model_unet.state_dict(),
-            'model_decoder': model_decoder.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
             'val_loss': total_val_loss
@@ -410,22 +428,24 @@ y = torch.stack(y).to(device)
 X = torch.stack(C).to(device)  # [N, 3, T_in] 
 D = torch.tensor(D, dtype=torch.float32).to(device)  # [N, T_in]
 X = torch.cat((X, D.unsqueeze(1)), dim=1)  # [N, 4, T_in]
-X = torch.cat((X, y.unsqueeze(1)), dim=1)  # [N, 5, T_in]
 
+# print('Signal is attached')
+# X = torch.cat((X, y.unsqueeze(1)), dim=1)  # [N, 5, T_in]
 
+print('Signal is not attached')
+X = torch.cat((X, torch.zeros_like(y).unsqueeze(1)), dim=1)  # [N, 5, T_in]
 
 print(X.shape, y.shape)
 
 N_in = X.shape[1]   # Number of input channels +1 (for distance gate)
 N_out = 1  # Number of output channels (MS2 signal)
 T_in = y.shape[1]
-model_unet = UNet1DVariableDecoder(N_in, encoder_depth=2, decoder_depth=2, base_channels=8,
-                                   init_thresh=0.1, init_alpha=100.0, learn_alpha=False,
-                                   use_DistanceGate_mask=True)
-model_decoder = CNNReconstructorResidual(out_channels=N_out, output_length=T_in)
+model_unet = UNet1DVariableDecoder(N_in, encoder_depth=1, decoder_depth=1, base_channels=8,
+                                   init_thresh=0.15, init_alpha=100.0, learn_alpha=False,
+                                   output_length=X.shape[-1],
+                                   use_DistanceGate_mask=False)
 
 model_unet.to(device)
-model_decoder.to(device)
 
 # Train/val split
 X_idx = np.arange(len(X))
@@ -466,22 +486,24 @@ val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
 # ----- Model, Loss, Optimizer -----
 criterion = nn.BCEWithLogitsLoss()
+criterion = nn.SmoothL1Loss()
+criterion = NormalizedCutLoss(k=2)
+criterion = EntropyLoss()
+
 criterion = nn.MSELoss()
 
-criterion = JointLoss(
-    recon_loss_fn=nn.MSELoss(),
-    mask_loss_fn=EntropyLoss(),
-    #mask_loss_fn=NormalizedCutLoss(k=2),
-    alpha=2.0,
-    beta=0.0
+criterion = CalibratedGaussianNLL(
+    lambda_var=1e-4,           # try 1e-5 to 1e-3
+    target_logvar=None,        # or math.log(sigma0**2) if you know noise level
+    lambda_prior=1e-4,         # if you set target_logvar
+    clip_logvar=(-8, 6),
+    warmup_steps=20,
+    total_steps=100000
 )
 
-state_loss_criterion = nn.BCEWithLogitsLoss(
-    pos_weight=torch.tensor([pos_weight_train]).to(device))
-
 optimizer = torch.optim.Adam(
-    list(model_unet.parameters()) + list(model_decoder.parameters()),
-      lr=5*1e-4)
+    list(model_unet.parameters()),
+      lr=1e-3)
 
 
 # ----- Training Loop -----
@@ -491,8 +513,8 @@ val_losses = []
 
 best_val_loss = float('inf')  # initialize to a large value
 for epoch in trange(num_epochs, desc="Training Progress"):
-    train_loss, recon_loss, mask_loss, distance_loss = train_epoch(model_unet, model_decoder, train_loader, optimizer, criterion, device)
-    val_loss, val_preds, val_targets, best_val_loss = validate_epoch(model_unet, model_decoder, val_loader, criterion, 
+    train_loss, recon_loss, mask_loss, distance_loss = train_epoch(model_unet, train_loader, optimizer, criterion, device)
+    val_loss, val_preds, val_targets, best_val_loss = validate_epoch(model_unet, val_loader, criterion, 
                                                       best_val_loss=best_val_loss, best_model_state=None,
                                                       device=device)
 
@@ -516,14 +538,12 @@ plt.title('Training and Validation Loss')
 plt.legend()
 plt.show()
 
-
 # %%
 torch.cuda.empty_cache()
 
 print(X_val.shape, y_val.shape)
 checkpoint = torch.load("best_model_EPMS2_to_states.pt", map_location='cpu')
 model_unet.load_state_dict(checkpoint['model_unet'])
-model_decoder.load_state_dict(checkpoint['model_decoder'])
 
 print("Learned threshold distance:", model_unet.gate.dc.item())
 print("Learned alpha distance:", model_unet.gate.alpha.item())
@@ -547,17 +567,31 @@ ax[0].legend()
 
 
 model_unet.eval()
-model_decoder.eval()
 model_unet.to('cpu')
-model_decoder.to('cpu')
 
-binary, distance_signal = model_unet(X_test.to('cpu'))  # [B, 1, T_out]
-output = model_decoder(binary.to('cpu'))  # [B, N, T_in]
-binary = torch.sigmoid(binary)  # Apply sigmoid to get probabilities
-output = torch.sigmoid(output)  # Apply sigmoid to get probabilities
+mean, logvar, distance_signal = model_unet(X_test.to('cpu'))  # [B, 1, T_out]
+binary = torch.sigmoid(mean)  # Apply sigmoid to get probabilities
 binary0 = binary.squeeze(1)  # [B, T_out]
-output = output.squeeze(1)  # [B, T_in]
+output = mean.squeeze(1)  # [B, T_in]
+std = torch.sqrt(torch.exp(logvar)).squeeze(1)  # [B, T_in]
 
+print(output[0].shape, std[0].shape)
+print(output[idx_chosen].cpu().detach().numpy()-std[idx_chosen].cpu().detach().numpy())
+print(output[idx_chosen].cpu().detach().numpy()+std[idx_chosen].cpu().detach().numpy())
+
+fig, ax = plt.subplots(3,1,figsize=(12, 9))
+ax[0].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten(), label='Signal', color='C0')
+ax[0].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under radius', color='k')
+
+ax[1].plot(y_test[idx_chosen, 0,:].cpu().numpy().flatten(), label='GT State', color='C1')
+ax[1].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+ax[1].fill_between(np.arange(len(output[idx_chosen])), 
+                   output[idx_chosen].cpu().detach().numpy()-std[idx_chosen].cpu().detach().numpy(), 
+                   output[idx_chosen].cpu().detach().numpy()+std[idx_chosen].cpu().detach().numpy(),
+                   alpha=0.2, color='C2'
+                   )
+
+ax[2].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 
 output_minmax = output.cpu().detach().numpy()
 
@@ -598,13 +632,13 @@ print(f"X_test shape: {X_test.shape}")
 
 
 
-fig, axs = plt.subplots(5,1,figsize=(12, 9))
+fig, axs = plt.subplots(4,1,figsize=(12, 9))
 
 axs[0].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten(), label='Signal', color='C0')
 axs[0].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under radius', color='k')
 
 #axs[0].plot(X_test[i,4,:].cpu().numpy().flatten(), label='GT State', color='C1')
-axs[0].plot(output_minmax[idx_chosen], label='Pred. State', color='C3')
+axs[0].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 axs[0].set_xlabel("Time")
 axs[0].set_ylabel("Signal Value")
 axs[0].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
@@ -613,14 +647,27 @@ axs[0].legend()
 axs[1].plot(X_test[idx_chosen,4,:].cpu().numpy().flatten(), label='Signal', color='C0')
 axs[1].plot(y_test[idx_chosen, 0,:].cpu().numpy().flatten(), label='GT State', color='C1')
 axs[1].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axs[1].fill_between(np.arange(len(output[idx_chosen])), 
+                   output[idx_chosen].cpu().detach().numpy()-std[idx_chosen].cpu().detach().numpy(), 
+                   output[idx_chosen].cpu().detach().numpy()+std[idx_chosen].cpu().detach().numpy(),
+                   alpha=0.2, color='C2'
+                   )
 axs[1].set_xlabel("Time")
 axs[1].set_ylabel("Signal Value")
 axs[1].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
 axs[1].legend()
 
-axs[2].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.1, label='Under radius', color='k')
-axs[2].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
-axs[2].plot(output_minmax[idx_chosen], label='Pred. State (Min-Max Norm)', color='C3')
+axs[2].plot(X_test[idx_chosen,3,:].cpu().numpy().flatten()<=0.15, label='Under 0.15', color='k')
+# twin axs
+axtwin = axs[2].twinx()
+axtwin.plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
+axtwin.fill_between(
+                   np.arange(len(output[idx_chosen])), 
+                   output[idx_chosen].cpu().detach().numpy()-std[idx_chosen].cpu().detach().numpy(), 
+                   output[idx_chosen].cpu().detach().numpy()+std[idx_chosen].cpu().detach().numpy(),
+                   alpha=0.2, color='C2'
+                   )
+axtwin.set_ylim(0, np.max(output[idx_chosen].cpu().detach().numpy()+std[idx_chosen].cpu().detach().numpy()))
 
 axs[2].set_xlabel("Time")
 axs[2].set_ylabel("Signal Value")
@@ -630,7 +677,7 @@ axs[2].legend()
 axs[3].plot(y_test[idx_chosen, 0,:].cpu().numpy().flatten(), label='GT State', color='C1')
 axs[3].plot(output[idx_chosen].cpu().detach().numpy().flatten(), label='Pred. State', color='C2')
 
-axs[3].plot(output_minmax[idx_chosen], label='Pred. State (Min-Max Norm)', color='C3')
+axs[3].plot(X_test_gated[idx_chosen].cpu().detach().numpy(), label='Gated Signal', color='C3')
 
 #axs[3].plot(, label='Pred. State', color='C2')
 
@@ -639,12 +686,12 @@ axs[3].set_ylabel("Signal Value")
 axs[3].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
 axs[3].legend()
 
-axs[4].plot(y_test[idx_chosen, 1,:].cpu().numpy().flatten(), label='GT State', color='C1')
-axs[4].plot(output_binary[idx_chosen], label='Pred. State (Min-Max Norm)', color='C3')
-axs[4].set_xlabel("Time")
-axs[4].set_ylabel("Signal Value")
-axs[4].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
-axs[4].legend()
+# axs[4].plot(y_test[idx_chosen, 1,:].cpu().numpy().flatten(), label='GT State', color='C1')
+# axs[4].plot(output_binary[idx_chosen], label='Pred. State (Min-Max Norm)', color='C3')
+# axs[4].set_xlabel("Time")
+# axs[4].set_ylabel("Signal Value")
+# axs[4].set_title(f"Residual of Output vs Binary sequence for X_test {idx_chosen+1}")
+# axs[4].legend()
 
 
 plt.tight_layout()
@@ -719,3 +766,348 @@ plt.xlim(0., 1)
 plt.show()
 
 # %%
+
+# pip install captum
+import torch
+import torch.nn as nn
+from typing import Optional, Sequence, Union
+
+from captum.attr import (
+    IntegratedGradients,
+    Saliency,
+    Occlusion,
+    DeepLift,
+    LRP,
+)
+
+"""
+
+Targets: Because wrapped(x) returns [B, T], target is the time index whose contribution you want. Pass a single int or a list to aggregate (sum) across indices.
+Baselines: For IG/DeepLIFT, start with zeros. If your inputs are standardized, a mean input baseline can be better.
+Occlusion: The time_window you choose should roughly match the temporal footprint you want to test (e.g., a kernel-receptive-field scale).
+Batching: All functions accept [B, C, T] and return attributions of the same shape (aggregated over chosen t_idx if a list).
+Stability: If you see noisy saliency, try smoothing (average attributions over small neighborhoods of t_idx) or use IG with more n_steps.
+
+"""
+
+############################################
+# 1) Wrapper so Captum sees ŷ_mean[B, T]
+############################################
+class MeanHeadWrapper(nn.Module):
+    """
+    Wraps your probabilistic model to expose just the mean output
+    with shape [B, T], suitable for Captum targets (time indices).
+    """
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        # Your model returns (mean [B,1,T], logvar [B,1,T], distance_signal)
+        mean, _, _ = self.model(x)
+        return mean.squeeze(1)  # [B, T]
+
+
+############################################
+# 2) Baselines & utilities
+############################################
+def make_baseline(
+    x: torch.Tensor,
+    kind: str = "zeros",
+    value: float = 0.0
+) -> torch.Tensor:
+    """
+    Create a baseline tensor for attribution methods that need one.
+    kind: "zeros" | "value" | "noise"
+    """
+    if kind == "zeros":
+        return torch.zeros_like(x)
+    elif kind == "value":
+        return torch.full_like(x, fill_value=value)
+    elif kind == "noise":
+        return torch.randn_like(x) * 0.01
+    else:
+        raise ValueError(f"Unknown baseline kind: {kind}")
+
+
+def _ensure_eval_and_requires_grad(model: nn.Module, x: torch.Tensor):
+    model.eval()
+    x = x.clone().detach().requires_grad_(True)
+    return x
+
+
+############################################
+# 3) Integrated Gradients
+############################################
+@torch.no_grad()
+def integrated_gradients(
+    wrapped: nn.Module,
+    x: torch.Tensor,
+    t_idx: Union[int, Sequence[int]],
+    n_steps: int = 128,
+    baseline_kind: str = "zeros",
+    baseline_value: float = 0.0
+) -> torch.Tensor:
+    """
+    Returns IG attributions with shape [B, C, T] for a single target index or
+    a list of indices aggregated by sum across targets.
+    """
+    x = _ensure_eval_and_requires_grad(wrapped, x)
+    baseline = make_baseline(x, baseline_kind, baseline_value)
+    ig = IntegratedGradients(wrapped)
+
+    if isinstance(t_idx, Sequence):
+        attrs = []
+        for t in t_idx:
+            a = ig.attribute(inputs=x, baselines=baseline, target=t, n_steps=n_steps)
+            attrs.append(a)
+        return torch.stack(attrs, dim=0).sum(0)  # sum across selected targets → [B,C,T]
+    else:
+        return ig.attribute(inputs=x, baselines=baseline, target=t_idx, n_steps=n_steps)
+
+
+############################################
+# 4) Saliency (vanilla gradients)
+############################################
+@torch.no_grad()
+def saliency_maps(
+    wrapped: nn.Module,
+    x: torch.Tensor,
+    t_idx: Union[int, Sequence[int]],
+    absolute: bool = True
+) -> torch.Tensor:
+    """
+    Returns saliency attributions [B,C,T]. If multiple t_idx are passed,
+    sums attributions over those targets.
+    """
+    x = _ensure_eval_and_requires_grad(wrapped, x)
+    sal = Saliency(wrapped)
+
+    if isinstance(t_idx, Sequence):
+        attrs = []
+        for t in t_idx:
+            a = sal.attribute(inputs=x, target=t, abs=absolute)
+            attrs.append(a)
+        A = torch.stack(attrs, dim=0).sum(0)
+        return A.abs() if absolute else A
+    else:
+        a = sal.attribute(inputs=x, target=t_idx, abs=absolute)
+        return a
+
+
+############################################
+# 5) Occlusion (sliding window along time)
+############################################
+@torch.no_grad()
+def occlusion_sensitivity(
+    wrapped: nn.Module,
+    x: torch.Tensor,
+    t_idx: Union[int, Sequence[int]],
+    time_window: int = 21,
+    stride: int = 7,
+    perturbation: float = 0.0,
+) -> torch.Tensor:
+    """
+    Occlusion with a temporal window. Uses a full-channel × time_window patch.
+    Returns attributions [B,C,T].
+    """
+    x = _ensure_eval_and_requires_grad(wrapped, x)
+    occ = Occlusion(wrapped)
+
+    # For input of shape [B, C, T], sliding_window_shapes excludes batch dim → (C, time_window)
+    sws = (x.shape[1], time_window)
+    st = (1, stride)
+
+    if isinstance(t_idx, Sequence):
+        attrs = []
+        for t in t_idx:
+            a = occ.attribute(
+                inputs=x,
+                target=t,
+                sliding_window_shapes=sws,
+                strides=st,
+                baselines=perturbation,  # a scalar baseline fills the occluded window
+            )
+            attrs.append(a)
+        return torch.stack(attrs, dim=0).sum(0)
+    else:
+        return occ.attribute(
+            inputs=x,
+            target=t_idx,
+            sliding_window_shapes=sws,
+            strides=st,
+            baselines=perturbation,
+        )
+
+
+############################################
+# 6) DeepLIFT
+############################################
+@torch.no_grad()
+def deeplift_attr(
+    wrapped: nn.Module,
+    x: torch.Tensor,
+    t_idx: Union[int, Sequence[int]],
+    baseline_kind: str = "zeros",
+    baseline_value: float = 0.0
+) -> torch.Tensor:
+    """
+    DeepLIFT attributions [B,C,T]. Requires a baseline.
+    """
+    x = _ensure_eval_and_requires_grad(wrapped, x)
+    baseline = make_baseline(x, baseline_kind, baseline_value)
+    dl = DeepLift(wrapped)
+
+    if isinstance(t_idx, Sequence):
+        attrs = []
+        for t in t_idx:
+            a = dl.attribute(inputs=x, baselines=baseline, target=t)
+            attrs.append(a)
+        return torch.stack(attrs, dim=0).sum(0)
+    else:
+        return dl.attribute(inputs=x, baselines=baseline, target=t_idx)
+
+
+############################################
+# 7) LRP
+############################################
+@torch.no_grad()
+def lrp_attr(
+    wrapped: nn.Module,
+    x: torch.Tensor,
+    t_idx: Union[int, Sequence[int]],
+) -> torch.Tensor:
+    """
+    LRP attributions [B,C,T].
+    Note: Captum's LRP works best with ReLU-style nets; convs are supported.
+    """
+    x = _ensure_eval_and_requires_grad(wrapped, x)
+    lrp = LRP(wrapped)
+
+    if isinstance(t_idx, Sequence):
+        attrs = []
+        for t in t_idx:
+            a = lrp.attribute(inputs=x, target=t)
+            attrs.append(a)
+        return torch.stack(attrs, dim=0).sum(0)
+    else:
+        return lrp.attribute(inputs=x, target=t_idx)
+
+
+############################################
+# 8) Example usage
+############################################
+model = model_unet
+wrapped = MeanHeadWrapper(model)     # expose mean[B,T]
+#x: torch.Tensor of shape [B, C, T] on the same device as model
+
+# Choose a specific time index, or a list (e.g., a segment)
+t_idx = 300
+t_idx = [295, 296, 305]
+
+# IG:
+ig_attr = integrated_gradients(wrapped, x, t_idx, n_steps=128, baseline_kind="zeros")
+
+# Saliency:
+sal_attr = saliency_maps(wrapped, x, t_idx, absolute=True)
+
+# Occlusion:
+occ_attr = occlusion_sensitivity(wrapped, x, t_idx, time_window=25, stride=5, perturbation=0.0)
+
+# DeepLIFT:
+dl_attr = deeplift_attr(wrapped, x, t_idx, baseline_kind="zeros")
+
+# LRP:
+lrp_attr = lrp_attr(wrapped, x, t_idx)
+
+############################################
+# 9) Optional: normalize for visualization
+############################################
+def normalize_attr(a: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Normalize per-sample to [-1, 1] by max absolute value.
+    Keeps sign information.
+    """
+    a = a.detach()
+    B = a.shape[0]
+    a = a / (a.view(B, -1).abs().amax(dim=1).view(B, 1, 1) + eps)
+    return a
+
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_attributions(
+    attributions: torch.Tensor,
+    inputs: Optional[torch.Tensor] = None,
+    sample_idx: int = 0,
+    channel_names: Optional[Sequence[str]] = None,
+    cmap: str = "seismic",
+    normalize: bool = True,
+    figsize: tuple = (12, 2.5),
+):
+    """
+    Plot per-channel per-time attributions for one sample.
+
+    Parameters
+    ----------
+    attributions : torch.Tensor
+        Shape [B, C, T]. Attribution scores.
+    inputs : torch.Tensor, optional
+        Shape [B, C, T]. Original inputs to overlay (scaled).
+    sample_idx : int
+        Which batch element to plot.
+    channel_names : list of str, optional
+        Names for each channel (default: "Ch0", "Ch1", ...).
+    cmap : str
+        Matplotlib colormap for attribution heatmaps.
+    normalize : bool
+        Whether to normalize attribution values to [-1,1] per channel.
+    figsize : tuple
+        Figure size per channel.
+    """
+    A = attributions[sample_idx].detach().cpu().numpy()  # [C,T]
+    if inputs is not None:
+        X = inputs[sample_idx].detach().cpu().numpy()    # [C,T]
+    else:
+        X = None
+
+    C, T = A.shape
+    if channel_names is None:
+        channel_names = [f"Ch{i}" for i in range(C)]
+
+    fig, axes = plt.subplots(C, 1, figsize=(figsize[0], figsize[1] * C), sharex=True)
+
+    if C == 1:
+        axes = [axes]
+
+    for i, ax in enumerate(axes):
+        a = A[i]
+        if normalize:
+            max_abs = np.max(np.abs(a)) + 1e-8
+            a = a / max_abs
+        im = ax.imshow(
+            a[np.newaxis, :], aspect="auto", cmap=cmap,
+            extent=[0, T, -0.5, 0.5], vmin=-1, vmax=1
+        )
+        ax.set_yticks([])
+        ax.set_ylabel(channel_names[i], rotation=0, labelpad=30, va="center")
+
+        if X is not None:
+            sig = X[i]
+            sig_norm = sig / (np.max(np.abs(sig)) + 1e-8)
+            ax.plot(np.linspace(0, T, len(sig)), sig_norm * 0.5, color="black", alpha=0.7)
+
+    axes[-1].set_xlabel("Time")
+    fig.colorbar(im, ax=axes, orientation="vertical", fraction=0.01, pad=0.02, label="Attribution")
+    plt.tight_layout()
+    plt.show()
+
+
+# Example: integrated gradients attribution
+ig_attr = integrated_gradients(wrapped, x, t_idx=300, n_steps=128)
+
+# Plot for the first sample
+plot_attributions(ig_attr, inputs=x, sample_idx=0,
+                  channel_names=["Signal", "Feat1", "Feat2", "Distance"])

@@ -185,7 +185,7 @@ class UNet1DVariableDecoder(nn.Module):
             x = self.reduce_channels[i](x)
 
         out = self.final_conv(x)
-        return out
+        return out, distance_signal
     
 
 class ResidualBlock1D(nn.Module):
@@ -234,6 +234,7 @@ def train_epoch(model_unet, model_decoder, dataloader, optimizer, criterion, dev
     total_loss = 0
     total_recon_loss = 0
     total_mask_loss = 0
+    total_distance_signal_loss = 0
 
     for i, (X_batch, y_batch) in enumerate(dataloader):
         X_batch = X_batch.to(device)
@@ -243,11 +244,19 @@ def train_epoch(model_unet, model_decoder, dataloader, optimizer, criterion, dev
         output_target = y_batch[:, 0, :]
         state_target = y_batch[:, 1, :]
 
-        binary_output = model_unet(X_batch)
+        binary_output,distance_signal = model_unet(X_batch)
+        if model_unet.use_DistanceGate_mask:
+            # do sparsity loss on distance_signal
+            loss_distance_signal = torch.mean(distance_signal)
+            loss_distance_signal *= 0.5
+            total_distance_signal_loss += loss_distance_signal.item()
+
         output = model_decoder(binary_output)
         output = output.clamp(-20, 20)  # logits are raw, keep in safe range
         binary_output = torch.sigmoid(binary_output)
         loss, recon_loss, mask_loss = criterion(output, state_target, binary_output)
+
+        loss += loss_distance_signal if model_unet.use_DistanceGate_mask else 0
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"⚠️ NaN/Inf detected in loss at batch {i}. Skipping update.")
@@ -284,6 +293,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
     model_decoder.eval()
 
     total_loss = 0
+    total_distance_signal_loss = 0
     val_preds = []
     val_targets = []
 
@@ -294,7 +304,12 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
         output_target = y_batch[:, 0, :]
         state_target = y_batch[:, 1, :]
 
-        binary_output = model_unet(X_batch)
+        binary_output,distance_signal = model_unet(X_batch)
+        if model_unet.use_DistanceGate_mask:
+            # do sparsity loss on distance_signal
+            loss_distance_signal = torch.mean(distance_signal)
+            loss_distance_signal *= 0.5
+            total_distance_signal_loss += loss_distance_signal.item()
         output = model_decoder(binary_output)
         output = output.clamp(-20, 20)  # logits are raw, keep in safe range
 
@@ -340,7 +355,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-with open('data/dataset_for_Jacob.pkl', 'rb') as f:
+with open('_data/dataset_for_Jacob.pkl', 'rb') as f:
     data = pickle.load(f)
 
 C = []
@@ -407,8 +422,8 @@ N_in = X.shape[1]   # Number of input channels +1 (for distance gate)
 N_out = 1  # Number of output channels (MS2 signal)
 T_in = y.shape[1]
 model_unet = UNet1DVariableDecoder(N_in, encoder_depth=2, decoder_depth=2, base_channels=8,
-                                   init_thresh=0.1, init_alpha=1.0, learn_alpha=False,
-                                   use_DistanceGate_mask=False)
+                                   init_thresh=0.1, init_alpha=100.0, learn_alpha=False,
+                                   use_DistanceGate_mask=True)
 model_decoder = CNNReconstructorResidual(out_channels=N_out, output_length=T_in)
 
 model_unet.to(device)
@@ -531,7 +546,7 @@ model_decoder.eval()
 model_unet.to('cpu')
 model_decoder.to('cpu')
 
-binary = model_unet(X_test.to('cpu'))  # [B, 1, T_out]
+binary, distance_signal = model_unet(X_test.to('cpu'))  # [B, 1, T_out]
 output = model_decoder(binary.to('cpu'))  # [B, N, T_in]
 binary = torch.sigmoid(binary)  # Apply sigmoid to get probabilities
 output = torch.sigmoid(output)  # Apply sigmoid to get probabilities

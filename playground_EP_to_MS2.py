@@ -77,6 +77,7 @@ class JointLoss(nn.Module):
         mask_loss = self.mask_loss_fn(binary_output)
 
         total = self.alpha * recon_loss + self.beta * mask_loss + 1e-6  
+
         return total, recon_loss, mask_loss
     
 
@@ -200,7 +201,7 @@ class ResidualBlock1D(nn.Module):
         return self.relu(out + residual)
 
 class CNNReconstructorResidual(nn.Module):
-    def __init__(self, out_channels, output_length, base_channels=64):
+    def __init__(self, out_channels, output_length, base_channels=32):
         super().__init__()
         self.output_length = output_length
         self.initial_conv = nn.Conv1d(128, base_channels, kernel_size=3, padding=1)
@@ -337,7 +338,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-with open('data/dataset_for_Jacob.pkl', 'rb') as f:
+with open('_data/dataset_for_Jacob.pkl', 'rb') as f:
     data = pickle.load(f)
 
 C = []
@@ -402,7 +403,7 @@ print(X.shape, y.shape)
 N_in = X.shape[1]   # Number of input channels +1 (for distance gate)
 N_out = 1  # Number of output channels (MS2 signal)
 T_in = y.shape[1]
-model_unet = UNet1DVariableDecoder(N_in, encoder_depth=2, decoder_depth=2, base_channels=8,
+model_unet = UNet1DVariableDecoder(N_in, encoder_depth=1, decoder_depth=1, base_channels=8,
                                    init_thresh=0.1, init_alpha=1.0, learn_alpha=False,
                                    use_DistanceGate_mask=False)
 model_decoder = CNNReconstructorResidual(out_channels=N_out, output_length=T_in)

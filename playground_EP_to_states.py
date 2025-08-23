@@ -337,7 +337,7 @@ def validate_epoch(model_unet, model_decoder, dataloader, criterion,
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-with open('data/dataset_for_Jacob.pkl', 'rb') as f:
+with open('_data/dataset_for_Jacob.pkl', 'rb') as f:
     data = pickle.load(f)
 
 C = []

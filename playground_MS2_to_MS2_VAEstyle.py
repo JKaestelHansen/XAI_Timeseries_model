@@ -425,7 +425,7 @@ class JointVAELoss_schedule(nn.Module):
         return total_loss, self.alpha * recon_loss, beta_val * kl_loss, self.sparsity_weight * sparsity_penalty
 
 # --- Load and preprocess data ---
-with open('data/dataset_for_Jacob.pkl', 'rb') as f:
+with open('_data/dataset_for_Jacob.pkl', 'rb') as f:
     data = pickle.load(f)
 
 y = []
@@ -490,7 +490,7 @@ model_unet = UNetBernoulliEncoder(1,
                                   encoder_depth=encoder_depth, 
                                   decoder_depth=decoder_depth, 
                                   base_channels=16,
-                                  causal=True  # Use causal convolutions
+                                  causal=False  # Use causal convolutions
                                   ).to(device)
 #model_decoder = AdaptiveTransformerReconstructor(out_channels=1, output_length=T_in).to(device)
 
