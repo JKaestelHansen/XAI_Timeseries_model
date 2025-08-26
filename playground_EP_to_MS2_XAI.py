@@ -278,8 +278,8 @@ def train_epoch(model_unet, dataloader, optimizer, criterion, device):
         sigmoid_mean = torch.sigmoid(mean)
         loss_entropy = 0.1 * EntropyLoss()(sigmoid_mean)
 
-        loss = criterion(mean, output_target) + 1e-6  
-        #loss = criterion(mean, logvar, output_target).mean() #+ loss_entropy
+        #loss = criterion(mean, output_target) + 1e-6  
+        loss = criterion(mean, logvar, output_target).mean() #+ loss_entropy
         loss += loss_distance_signal if model_unet.use_DistanceGate_mask else 0
 
         if torch.isnan(loss) or torch.isinf(loss):
@@ -330,8 +330,8 @@ def validate_epoch(model_unet, dataloader, criterion,
             loss_distance_signal *= 4
             total_distance_signal_loss += loss_distance_signal.item()
 
-        loss = criterion(mean, output_target)
-        #loss = criterion(mean, logvar, output_target).mean() #+ loss_entropy
+        # loss = criterion(mean, output_target)
+        loss = criterion(mean, logvar, output_target).mean() #+ loss_entropy
         loss += loss_distance_signal if model_unet.use_DistanceGate_mask else 0
 
         total_loss += loss.item()
@@ -343,7 +343,6 @@ def validate_epoch(model_unet, dataloader, criterion,
 
     total_val_loss = total_loss / len(dataloader)
     if total_val_loss < best_val_loss:
-        print(f"New best validation loss: {total_val_loss:.4f} at best_val_loss {best_val_loss}")
         best_val_loss = total_val_loss
         best_model_state = {
             'model_unet': model_unet.state_dict(),
@@ -415,13 +414,6 @@ fulltime_padded_states = np.clip(fulltime_padded_states, 0, 1)
 print(f"Number of samples: {len(y)}")
 print('fulltime_padded_states', len(fulltime_padded_states_all), fulltime_padded_states_all[0].shape)
 print(f"Shape of C: {C[0].shape}, Shape of D: {len(D[0])}, Shape of y: {y[0].shape}")
-
-plt.figure(figsize=(10, 4))
-plt.plot(y[0])
-plt.title("Distance between EPs")
-plt.xlabel("Time")
-plt.ylabel("Distance")
-plt.show()
 
 y = torch.stack(y).to(device)
 
@@ -520,11 +512,6 @@ for epoch in trange(num_epochs, desc="Training Progress"):
 
     train_losses.append(train_loss)
     val_losses.append(val_loss)
-
-    print("Learned threshold distance:", model_unet.gate.dc.item())
-    print("Learned alpha distance:", model_unet.gate.alpha.item())
-
-    print(f"[Epoch {epoch+1}/{num_epochs}]  🔧 Train Loss: {train_loss:.4f}, Recon Loss: {recon_loss:.4f}, Mask Loss: {mask_loss:.4f}, Distance loss: {distance_loss:.4f}, Val loss: {val_loss:.4f}")
 
 print("Learned threshold distance:", model_unet.gate.dc.item())
 
@@ -732,8 +719,8 @@ output_binary_seglengths_flat = np.concatenate(output_binary_seglengths)
     
 
 plt.figure(figsize=(5, 4))
-plt.hist(states_all_test_seglengths_flat, bins=100, alpha=0.5, label='GT State Segments')
-plt.hist(output_binary_seglengths_flat, bins=100, alpha=0.5, label='Pred. Binary Segments')
+plt.hist(states_all_test_seglengths_flat, bins=100, alpha=0.5, density=True, label='GT State Segments')
+plt.hist(output_binary_seglengths_flat, bins=100, alpha=0.5, density=True, label='Pred. Binary Segments')
 plt.xlabel('Segment Length')
 plt.ylabel('Frequency')
 plt.title('Segment Length Distribution')
@@ -741,7 +728,7 @@ plt.legend(loc='upper right')
 
 plt.annotate(f'Avg. seg. length GT: {np.mean(states_all_test_seglengths_flat):.2f}\n'
              f'Avg. seg. length Pred: {np.mean(output_binary_seglengths_flat):.2f}',
-             xy=(0.73, 0.8), xycoords='axes fraction',
+             xy=(0.5, 0.8), xycoords='axes fraction',
              fontsize=10, ha='left', va='top')
 plt.show()
 
@@ -1000,6 +987,7 @@ def lrp_attr(
 model = model_unet
 wrapped = MeanHeadWrapper(model)     # expose mean[B,T]
 #x: torch.Tensor of shape [B, C, T] on the same device as model
+x = X_test.to(next(model.parameters()).device)
 
 # Choose a specific time index, or a list (e.g., a segment)
 t_idx = 300
