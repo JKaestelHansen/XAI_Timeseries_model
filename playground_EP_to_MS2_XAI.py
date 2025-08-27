@@ -264,10 +264,21 @@ def train_epoch(model_unet, dataloader, optimizer, criterion, device):
         optimizer.zero_grad()
 
         output_target = y_batch[:, 0, :]
-        if output_target.dim() == 2:
-            output_target = output_target.unsqueeze(1)
 
         mean, logvar, distance_signal = model_unet(X_batch)
+
+        if output_target.dim() == 3:
+            output_target = output_target.squeeze(1)
+        if mean.dim() == 3:
+            mean = mean.squeeze(1)
+        if logvar.dim() == 3:
+            logvar = logvar.squeeze(1)
+
+        assert y_batch.shape == output.shape == logvar.shape
+
+        if i == 0:
+            print(mean.shape, output_target.shape, logvar.shape)
+
         mean = mean.clamp(-20, 20)  # logits are raw, keep in safe range
         if model_unet.use_DistanceGate_mask:
             # do sparsity loss on distance_signal
