@@ -1,6 +1,10 @@
 # XAI_Timeseries_model
 Explainable AI model (XAI) for timeseries data.
 
+This repo explores probabilistic predictions of time series data, various loss functions, and attribution/explainability using captum etc for the problem of mapping enhancer promoter interactions to active transcription.
+
+The repo also functions as look up for various attribution/saliency/interpretability approaches and noise tunneling.
+
 The goal is to learn Y (MS2 intensities, binds nascant RNA to visualize transcription) from X (enhancer promoter distances) and in the process learn what in enhancer promoter interactions are important, thus uncovering important aspects of gene regulation. Potentially, utilize Y in input for self-supervision.
 
 - Predicitons and uncertainty estimation per time point
