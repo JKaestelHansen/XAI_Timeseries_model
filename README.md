@@ -13,6 +13,12 @@ playground_toyUnet_n_Tranformer.py
 plot_playground_toyUnet_n_Tranformer.py
 - WIP: Script to plot results from playground_toyUnet_n_Tranformer.py. Train/val loss curves, examples of predictions, and plotting + explanation of saliency/feature importance attribution.
 
+<img width="989" height="590" alt="image" src="https://github.com/user-attachments/assets/98185d22-7342-449c-8255-da46fae69b78" />
+<img width="998" height="990" alt="image" src="https://github.com/user-attachments/assets/05f1c0a0-7384-4113-a1a6-daf3dd61364a" />
+
+
+
+
 playground_EP_to_MS2_XAI.py
 - WIP
 - Explores mapping from EP to MS2
